@@ -1,0 +1,1510 @@
+; ISR_example.asm: a) Increments/decrements a BCD variable every half second using
+; an ISR for timer 2; b) Generates a 2kHz square wave at pin P3.7 using
+; an ISR for timer 0; and c) in the 'main' loop it displays the variable
+; incremented/decremented using the ISR for timer 0 on the LCD.  Also resets it to 
+; zero if the 'BOOT' pushbutton connected to P4.5 is pressed.
+$NOLIST
+$MODLP52
+$LIST
+
+CLK           EQU 22118400 ; Microcontroller system crystal frequency in Hz
+TIMER0_RATE   EQU 4096     ; 2048Hz squarewave (peak amplitude of CEM-1203 speaker)
+TIMER0_RELOAD EQU ((65536-(CLK/TIMER0_RATE)))
+TIMER2_RATE   EQU 1000     ; 1000Hz, for a timer tick of 1ms
+TIMER2_RELOAD EQU ((65536-(CLK/TIMER2_RATE)))
+BOOT_BUTTON   EQU P4.5
+
+; Reset vector
+org 0000H
+   ljmp main
+; External interrupt 0 vector (not used in this code)
+org 0003H
+	reti
+; Timer/Counter 0 overflow interrupt vector
+org 0013H
+	reti
+; Timer/Counter 1 overflow interrupt vector (not used in this code)
+org 001BH
+	reti
+; Serial port receive/transmit interrupt vector (not used in this code)
+org 0023H 
+	reti	
+; Timer/Counter 2 overflow interrupt vector
+org 002BH
+	ljmp Timer2_ISR
+
+dseg at 30h
+Count1ms:             ds 2 ; Used to determine when half second has passed
+BCD_counter:          ds 1 ; The BCD counter incrememted in the ISR and displayed in the main loop
+minutes:              ds 1
+hours:                ds 1
+rflw_temp:            ds 2
+rflw_time:            ds 2
+soak_time:            ds 2
+soak_temp:            ds 2
+Result:               ds 2 
+bcd:                  ds 5
+bcd1:                 ds 5 
+x:                    ds 4 ; results stored here from math32 library
+y:                    ds 4 ; used in operations for math32 library
+current_temp:         ds 2
+cursor_pos_p0:        ds 1 ; location of the user cursor on the LCD display 
+cursor_pos_p1:        ds 1 ;
+page_num:             ds 1 ; determines what page to display to user 
+curr_state_disp:      ds 1
+
+;rflw fsm
+state2_seconds:       ds 1
+state4_seconds:       ds 1
+
+;rflw fsm
+state:                ds 1
+temp:                 ds 1
+pwm:                  ds 1
+sec:                  ds 1
+oven_temp:            ds 2
+ambient_temp:         ds 2
+curr_temp:            ds 2
+
+; op-amp, k-type
+voltage:              ds 2
+variable:             ds 2
+z:                    ds 4
+
+; -------------------------- FLAGS --------------------------------------------------
+bseg
+;UI flags
+half_seconds_flag:    dbit 1 ; set to one in the ISR every time 500 ms had passed
+start_flag:           dbit 1 ;
+mf:                   dbit 1 ; used in operations for math32 library
+rflw_process_flag:    dbit 1 ; display reflow process information to user
+rflw_page_flag:       dbit 1 ; switching between displaying reflow and soak parameters
+disp_rflw_flag:       dbit 1
+modify_rflw_flag:     dbit 1 ; user has selected to change reflow temp and time
+modify_soak_flag:     dbit 1 ; user has selected to change soak temp and time
+up_flag:              dbit 1
+down_flag:            dbit 1 
+enter_flag:           dbit 1
+back_flag:            dbit 1
+test_flag:            dbit 1
+on_flag:              dbit 1 ; is oven on/off
+
+;rflw fsm
+reset_seconds:        dbit 1
+one_second_flag:      dbit 1 
+state2_seconds_flag:  dbit 1
+state4_seconds_flag:  dbit 1
+disp_temp_flag:       dbit 1
+delay_temp_disp_flag: dbit 1
+
+;duty cycle flags
+half_seconds_flag2:   dbit 1
+oven_on_flag:         dbit 1; CPLs oven port when set
+s0:                   dbit 1
+s1:                   dbit 1
+s2: 				 dbit 1
+s3: 				 dbit 1
+s4: 				 dbit 1
+s5: 				 dbit 1
+s6: 				 dbit 1
+s7: 				 dbit 1
+s8: 				 dbit 1
+s9: 				 dbit 1
+
+; ------------------------------------------------------------------------------------
+
+cseg
+; These 'equ' must match the wiring between the microcontroller and the LCD!
+LCD_RS  	equ P1.4
+LCD_RW  	equ P1.5
+LCD_E   	equ P1.6
+LCD_D4  	equ P3.2
+LCD_D5 		equ P3.3
+LCD_D6      equ P3.4
+LCD_D7      equ P3.5
+
+; SPI declarations
+BAUD        equ 115200
+T2LOAD      equ (0x10000-(CLK/(16*BAUD)))
+CE_ADC      equ P2.0
+MY_MOSI     equ P2.1
+MY_MISO     equ P2.2
+MY_SCLK     equ P2.3
+
+; button declarations
+UP_BT       equ P1.0
+DOWN_BT     equ P1.1
+BACK_BT     equ P1.2
+ENTER_BT    equ P1.3
+STOP_BT     equ P1.7
+START_BT    equ P3.6 
+
+;port declaration
+OVEN_PIN    equ P2.4
+SOUND_OUT   equ P3.7
+
+;MACROS
+putty mac
+	mov   a, %0
+	swap  a
+	anl   a, #0x0f
+	orl   a, #0x30
+	lcall putchar
+	mov   a, %0
+	anl   a, #0x0f
+	orl   a, #0x30
+	lcall putchar
+endmac
+Wait_Milli_Seconds_new mac
+	push  AR2
+	mov   R2, %0
+	lcall ?Wait_Milli_Seconds_new
+	pop   AR2
+endmac
+
+?Wait_Milli_Seconds_new:
+	push AR0
+	push AR1
+L3_new: mov R1, #45
+L2_new: mov R0, #166
+L1_new: djnz R0, L1_new ; 3 cycles->3*45.21123ns*166=22.51519us
+   djnz R1, L2_new ; 22.51519us*45=1.013ms
+   lcall ?back_pressed
+   jb    back_flag, mov_state_main1
+   djnz R2, L3_new ; number of millisecons to wait passed in R2
+   pop AR1
+   pop AR0
+   ret
+mov_state_main1:
+	ljmp state_main1
+
+; --- Include files ------------------------------------------------------------------------
+$NOLIST
+$include(LCD_4bit.inc) ; A library of LCD related functions and utility macros
+$include(math32.inc)   ; A library of 32 bit arithmetic functions 
+$LIST
+; ------------------------------------------------------------------------------------------
+; --- STRINGS ---
+;                   1234567890123456    <- This helps determine the position of the counter
+colon:              db ':',                0
+cursor:             db '>',                0
+space:              db ' ',                0
+clear_screen:       db '                ', 0
+loading:            db 'loading',          0
+dot:                db '.',                0
+soak_time_txt:      db 'Soak Time: ',      0
+soak_temp_txt:      db 'Soak Temp: ',      0
+rflw_temp_txt:      db 'Rflw Temp: ',       0
+rflw_time_txt:      db 'Rflw Time: ',       0
+ambient_temp_txt:       db 'Room:',    0
+oven_temp_txt:          db 'Oven:',       0
+reflow:             db 'Reflow:',          0
+soak:               db 'Soak:',            0
+celcius:            db 'Celcius',          0
+fheight:            db 'Fahrenheight',     0
+welcome_message:    db 'JESUS 6',          0
+menu1_op1:          db 'Temperature    ',  0
+menu1_op2:          db 'Reflow Process ',  0
+menu1_op3:          db 'Running Time   ',  0
+menu1_op4:          db 'Settings       ',  0
+curr_session:       db 'State: ',          0
+eight_spaces:       db '        ',         0
+four_spaces:        db '    ',             0
+
+;---------------------------------;
+; Routine to initialize SPI       ;
+; communications                  ;
+;---------------------------------;
+; Configure the serial port and baud rate using timer 1
+
+InitSerialPort:
+	clr  TR1 ; Disable timer 1
+	anl  TMOD, #0x0f ; RCLK=1, TCLK=1 
+	orl  TMOD, #0x20
+	orl  PCON, #80H
+	mov  TH1,  #244
+	mov  TL1,  #244
+	setb TR1 ; TR1 COULD BE IMPORTANT
+	mov  SCON, #52H
+	ret
+		
+INIT_SPI: 
+   setb MY_MISO
+   clr  MY_SCLK
+   ret
+DO_SPI_G:
+	push acc
+	mov  R1, #0
+	mov  R2, #8
+DO_SPI_G_LOOP:
+	mov  a, R0
+	rlc  a
+	mov  R0, a
+	mov  MY_MOSI, c
+	setb MY_SCLK
+	mov  c, MY_MISO
+	mov  a, R1
+	rlc  a
+	mov  R1, a
+	clr  MY_SCLK
+	djnz R2, DO_SPI_G_LOOP
+   pop  acc
+	ret
+   
+; Send a character using the serial port
+putchar:
+   JNB TI, putchar
+   CLR TI
+   MOV SBUF, a
+   RET
+; Send a constant-zero-terminated string through the serial port
+SendString:
+   CLR   A
+   MOVC  A, @A+DPTR
+   JZ    SendStringDone
+   LCALL putchar
+   INC   DPTR
+   SJMP  SendString
+SendStringDone:
+   ret
+
+;---------------------------------;
+; Routine to initialize the ISR   ;
+; for timer 2                     ;
+;---------------------------------;
+Timer2_Init:
+	mov T2CON, #0 ; Stop timer.  Autoreload mode.
+	; One millisecond interrupt
+	mov RCAP2H, #high(TIMER2_RELOAD)
+	mov RCAP2L, #low(TIMER2_RELOAD)
+	; Set the 16-bit variable Count1ms to zero
+	clr a
+	mov Count1ms+0, a
+	mov Count1ms+1, a
+	; Enable the timer and interrupts
+   setb ET2  ; Enable timer 2 interrupt
+   setb TR2  ; Enable timer 2
+   setb EA   ; Enable Global interrupts
+	ret
+;---------------------------------;
+; ISR for timer 2                 ;
+;---------------------------------;
+Timer2_ISR:
+	clr  TF2  ; Timer 2 doesn't clear TF2 automatically in ISR	
+	; The two registers used in the ISR must be saved in the stack
+	push acc
+	push psw		
+	; Increment the 16-bit counter
+	inc  Count1ms+0    ; Increment the low 8-bits first
+	mov  a, Count1ms+0 ; If the low 8-bits overflow, then increment high 8-bits
+	jnz  Inc_Done
+	inc  Count1ms+1
+Inc_Done:
+;check which duty cycle is set
+F:
+
+	jnb  s0, F1
+	mov  a, Count1ms+0
+	cjne a, #low(50), Bridge
+	mov  a, Count1ms+1
+	cjne a, #high(50), Bridge
+	clr  OVEN_PIN
+
+F1:
+	jnb s1, F2
+	mov  a, Count1ms+0
+	cjne a, #low(100), Bridge
+	mov  a, Count1ms+1
+	cjne a, #high(100), Bridge
+	clr  OVEN_PIN
+
+F2:
+	jnb  s2, F3
+	mov  a, Count1ms+0
+	cjne a, #low(120), Bridge
+	mov  a, Count1ms+1
+	cjne a, #high(120), Bridge
+	clr  OVEN_PIN
+
+F3:
+	jnb  s3, F4
+	mov  a, Count1ms+0
+	cjne a, #low(400), Bridge
+	mov  a, Count1ms+1
+	cjne a, #high(400), Bridge
+	clr  OVEN_PIN
+	
+Bridge:
+	ljmp F9
+
+F4:
+	jnb  s4, F5
+	mov  a, Count1ms+0
+	cjne a, #low(500), Bridge
+	mov  a, Count1ms+1
+	cjne a, #high(500), Bridge
+	clr  OVEN_PIN
+
+F5:
+	jnb  s5, F6
+	mov  a, Count1ms+0
+	cjne a, #low(600), F9
+	mov  a, Count1ms+1
+	cjne a, #high(600), F9
+	clr  OVEN_PIN
+
+F6: 
+	jnb  s6, F7
+	mov  a, Count1ms+0
+	cjne a, #low(700), F9
+	mov  a, Count1ms+1
+	cjne a, #high(700), F9
+	clr  OVEN_PIN
+
+F7:
+	jnb  s7, F8
+	mov  a, Count1ms+0
+	cjne a, #low(800), F9
+	mov  a, Count1ms+1
+	cjne a, #high(800), F9
+	clr  OVEN_PIN
+
+F8:
+	jnb  s8, F9
+	mov  a, Count1ms+0
+	cjne a, #low(950), F9
+	mov  a, Count1ms+1
+	cjne a, #high(950), F9
+	clr  OVEN_PIN
+	
+F9:
+	; Check if 1 second has passed
+	mov  a, Count1ms+0
+	cjne a, #low(1000), Timer2_ISR_done
+	mov  a, Count1ms+1
+	cjne a, #high(1000), Timer2_ISR_done
+	
+	; 500 milliseconds have passed.  Set a flag so the main program knows
+	setb half_seconds_flag ; Let the main program know half second had passed
+	;cpl  TR1 ; This line makes a beep-silence-beep-silence sound
+	
+	; Reset the milli-seconds counter, it is a 16-bit variable
+	clr  a
+	mov  Count1ms+0, a
+	mov  Count1ms+1, a
+	
+	jb on_flag, oven_on
+	sjmp oven_off
+oven_on:
+	setb  OVEN_PIN
+	sjmp  timer2_isr_cont
+oven_off:
+	clr OVEN_PIN
+timer2_isr_cont:
+	mov  a, BCD_counter
+	add  a, #0x01
+	sjmp Timer2_ISR_da
+Timer2_ISR_da:
+	jb   on_flag, start_counter
+	setb delay_temp_disp_flag
+	sjmp Timer2_ISR_done
+start_counter:
+	da   a
+	mov  BCD_counter, a	
+	
+	lcall variable_display
+	lcall voltage_display
+	
+	setb delay_temp_disp_flag
+	jnb  state2_seconds_flag, counter_cont
+	mov  a, state2_seconds
+	add  a, #0x01
+	da   a
+	mov  state2_seconds, a
+counter_cont:
+	jnb state4_seconds_flag, counter_cont1
+	mov a, state4_seconds
+	add a, #0x01
+	da a
+	mov state4_seconds, a
+counter_cont1:
+		;has it been 60 seconds?
+	mov  a, BCD_counter
+	cjne a, #0x60, Timer2_ISR_done
+	;lcall ?thermo_in
+	clr  a
+	da   a
+	mov BCD_counter, a
+	clr  a
+	mov  a, minutes
+	add  a, #0x01
+	da   a
+	mov  minutes, a
+	;has it been 60 minutes?
+	mov  a, minutes
+	cjne a, #0x60, Timer2_ISR_done
+	clr  a
+	da   a
+	mov  minutes, a
+	clr  a
+	mov  a, hours
+	add  a, #0x01
+	da   a
+	mov  hours, a
+Timer2_ISR_done:
+	pop  psw
+	pop  acc
+	reti
+	
+	
+; ----------------- K-TYPE THERMOCOUPLE -------------
+; ---------------------------------------------------
+; ---------------------------------------------------
+
+; op-amp, k-type
+spi_comm:
+	clr CE_ADC
+	mov R0, #00000001B
+	lcall DO_SPI_G
+	mov R0, #10000000B
+	lcall DO_SPI_G
+	mov a, R1
+   anl a, #00000011B   ;just AND
+   mov voltage+1, a
+   mov R0, #55H
+   lcall DO_SPI_G
+   mov voltage, R1
+   setb CE_ADC
+   Wait_Milli_Seconds(#10)    	
+   clr CE_ADC
+	mov R0, #00000001B
+	lcall DO_SPI_G	
+	mov R0, #10010000B
+	lcall DO_SPI_G
+	mov a, R1
+   anl a, #00000011B   ;just AND
+   mov variable+1, a   
+   mov R0, #55H
+   lcall DO_SPI_G
+   mov variable, R1
+	setb CE_ADC	
+	ret
+
+; ************************************************ MAIN ************************************************
+; ******************************************************************************************************    
+
+;---------------------------------;
+; Main program. Includes hardware ;
+; initialization and 'forever'    ;
+; loop.                           ;
+;---------------------------------;
+main:
+	; Initialization
+	;clr skip_flag
+   mov   SP, #7FH ; Set the stack pointer to the beginning of idata 
+   mov   PMOD, #0 ; Configure all ports in bidirectional mode
+   
+   lcall Timer2_Init    ; Initialize timer 2 for the running clock
+   lcall LCD_4BIT		 ; Initialize the LCD to display data
+   lcall InitSerialPort
+   lcall INIT_SPI
+   
+   ;rflw FSM
+   lcall init_FSM       ; Initilize reflow FSM
+	lcall loading_screen ; Display loading screen
+   Send_Constant_String(#clear_screen)	; clear the screen so we can display menu options
+
+	; initializing flags
+   setb half_seconds_flag
+   clr  rflw_process_flag
+   clr  modify_rflw_flag
+   clr  modify_soak_flag
+   clr  test_flag
+   clr  on_flag
+   
+	mov  BCD_counter, #0x00
+	mov  hours,       #0x00
+	mov  minutes,     #0x00
+	mov  state,       #0x00
+	
+	; initializing time values
+	clr  a
+	da   a
+	mov  cursor_pos_p0, a
+	mov  page_num,      a
+	
+	; initialize reflow parameters
+	mov  a, #0x60 ; 60 seconds is minimum soak time (default)
+	da   a
+	mov  soak_time, a	
+	mov  a, #0x30 ; 30 seconds is minimum reflow time (default)
+	da   a
+	mov  rflw_time, a
+	mov  a, #0x20
+	da   a
+	mov  rflw_temp+0, a
+	mov  a, #0x40
+	da   a
+	mov  soak_temp+0, a
+	mov  a, #0x01
+	da   a
+	mov  soak_temp+1, a	
+	mov  a, #0x02
+	da   a
+	mov  rflw_temp+1, a
+	
+	lcall ClearAllFlags
+	
+loop:
+	ljmp  state_main1
+	
+; After initialization the program stays in this 'forever' loop
+loop_test:
+	jb    BOOT_BUTTON, loop_a  ; if the 'BOOT' button is not pressed skip
+	Wait_Milli_Seconds(#50)	; Debounce delay.  This macro is also in 'LCD_4bit.inc'
+	jb    BOOT_BUTTON, loop_a  ; if the 'BOOT' button is not pressed skip
+	jnb   BOOT_BUTTON, $		; wait for button release
+	; A clean press of the 'BOOT' button has been detected, reset the BCD counter.
+	; But first stop the timer and reset the milli-seconds counter, to resync everything.
+		
+	clr   TR0
+	clr   a
+	mov   Count1ms+0, a
+	mov   Count1ms+1, a
+	; Now clear the BCD counter
+	
+	mov   BCD_counter, #0x00
+	setb  TR0                ; Re-enable the timer
+	sjmp  loop_b             
+loop_a:
+	jnb   half_seconds_flag, exit_ms_count
+loop_b:
+   clr   half_seconds_flag ; We clear this flag in the main loop, but it is set in the ISR for timer 0
+exit_ms_count:
+	Set_Cursor(1, 15)
+	Display_BCD(state)
+	lcall ?start_pressed
+	lcall ?stop_pressed
+	lcall forever_FSM_start
+	lcall spi_comm
+	ret
+; ************************************************ END MAIN ************************************************
+; **********************************************************************************************************    
+	
+;******************************************* UI FSM **********************************
+state_main1: ; main menu with cursor on 1st item
+	lcall clear_ui_flags
+	Set_Cursor(1,1)
+	Send_Constant_String(#cursor)
+	Set_Cursor(2, 1)
+	Send_Constant_String(#space)
+	Set_Cursor(1, 2)
+	Send_Constant_String(#menu1_op1)
+	Set_Cursor(2, 2)
+	Send_Constant_String(#menu1_op2)
+	lcall ?enter_pressed
+	jb    enter_flag, jmp_state_temp
+	lcall ?down_pressed
+	lcall loop_test
+	jb    down_flag, state_main2
+	ljmp  state_main1
+jmp_state_temp:
+	ljmp  state_temp
+	
+state_main2: ; main meni with cursor on 2nd item
+	lcall clear_ui_flags
+	Set_Cursor(2, 1)
+	Send_Constant_String(#cursor)
+	Set_Cursor(1, 1)
+	Send_Constant_String(#space)
+	Set_Cursor(1, 2)
+	Send_Constant_String(#menu1_op1)
+	Set_Cursor(2, 2)
+	Send_Constant_String(#menu1_op2)
+	lcall loop_test
+	lcall ?enter_pressed
+	jb    enter_flag, jmp_state_disp_rflw
+	lcall ?down_pressed
+	jb    down_flag, state_main3
+	lcall ?up_pressed
+	jb    up_flag, jmp_state_main1
+	ljmp  state_main2
+jmp_state_main1:
+	ljmp  state_main1
+jmp_state_disp_rflw:
+	ljmp  state_disp_rflw
+
+state_main3: ; main menu with cursor on 3rd item
+	lcall clear_ui_flags
+	Set_Cursor(1, 1)
+	Send_Constant_String(#cursor)
+	Set_Cursor(2, 1)
+	Send_Constant_String(#space)
+	Set_Cursor(1, 2)
+	Send_Constant_String(#menu1_op3)
+	Set_Cursor(2, 2)
+	Send_Constant_String(#menu1_op4)
+	lcall loop_test
+	lcall ?enter_pressed
+	jb    enter_flag, jmp_state_runtime
+	lcall ?down_pressed
+	jb    down_flag, state_main4
+	lcall ?up_pressed
+	jb    up_flag, jmp_state_main2
+	ljmp  state_main3
+jmp_state_runtime:
+	ljmp  state_runtime
+jmp_state_main2:
+	ljmp  state_main2
+
+state_main4: ; main menu with cursor on 4th item
+	lcall clear_ui_flags
+	Set_Cursor(2, 1)
+	Send_Constant_String(#cursor)
+	Set_Cursor(1, 1)
+	Send_Constant_String(#space)
+	Set_cursor(1, 2)
+	Send_Constant_String(#menu1_op3)
+	Set_Cursor(2, 2)
+	Send_Constant_String(#menu1_op4)
+	lcall loop_test
+	lcall ?enter_pressed
+	jb    enter_flag, jmp_state_settings
+	lcall ?up_pressed
+	jb    up_flag, jmp_state_main3
+	ljmp  state_main4
+jmp_state_settings:
+	ljmp  state_settings
+jmp_state_main3:
+	ljmp  state_main3
+
+state_temp: ; display the ambient and oven temperature
+	lcall voltage_display
+	lcall display_oven_temp
+	lcall variable_display
+	lcall display_ambient_temp
+	lcall clear_ui_flags
+	setb  disp_temp_flag
+	Set_Cursor(1, 1)
+	Send_Constant_String(#ambient_temp_txt)	
+	Set_Cursor(2, 1)
+	Send_Constant_String(#oven_temp_txt)
+	Set_Cursor(2, 13)
+	Send_Constant_String(#four_spaces)
+	Set_Cursor(1, 10)
+	Send_Constant_String(#four_spaces)
+	Set_Cursor(2, 10)
+	Send_Constant_String(#four_spaceS)
+	lcall loop_test
+	lcall ?back_pressed
+	jb    back_flag, jmp_state_main1_b
+	Wait_Milli_Seconds_new(#250)
+	Wait_Milli_Seconds_new(#250)
+	Wait_Milli_Seconds_new(#250)
+	Wait_Milli_Seconds_new(#250)
+	ljmp  state_temp
+jmp_state_main1_b:
+	ljmp  state_main1
+
+state_settings: ; display the changeable settings (C/F/K)
+	lcall clear_ui_flags
+	lcall loop_test
+	lcall ?back_pressed
+	jb    back_flag, jmp_state_main4
+	lcall settings_cursor
+	Set_Cursor(2, 2)
+	Send_Constant_String(#celcius)
+	Set_Cursor(1, 2)
+	Send_Constant_String(#fheight)
+	ljmp  state_settings
+jmp_state_main4:
+	ljmp  state_main4
+
+state_runtime: ; display how long the oven has been running for, 
+	lcall clear_ui_flags
+	lcall loop_test
+	lcall ?back_pressed
+	jb    back_flag, jmp_state_main3_b
+	lcall disp_runtime
+	ljmp  state_runtime
+jmp_state_main3_b:
+	ljmp  state_main3
+disp_runtime:
+	Set_Cursor(1, 1)
+	Send_Constant_String(#curr_session)
+	Set_Cursor(1, 7)
+	Send_Constant_String(#eight_spaces)
+	Set_Cursor(2, 1)
+	Send_Constant_String(#eight_spaces)
+	Set_Cursor(2, 9)
+	Display_BCD(hours)
+	Set_Cursor(2, 11)
+	Send_Constant_String(#colon)
+	Set_Cursor(2, 12)
+	Display_BCD(minutes)
+	Set_Cursor(2, 14)
+	Send_Constant_String(#colon)	
+	Set_Cursor(2, 15)
+	Display_BCD(BCD_counter)
+	ret
+
+state_disp_rflw: ;display reflow time and temperature
+	lcall clear_ui_flags
+	Set_Cursor(1, 1)
+	Send_Constant_String(#rflw_time_txt)
+	lcall disp_rflw_time
+	Set_Cursor(2, 1)
+	Send_Constant_String(#rflw_temp_txt)
+	lcall disp_rflw_temp
+	lcall loop_test
+	lcall ?enter_pressed
+	jb    enter_flag, jmp_state_mod_rflw
+	lcall ?down_pressed
+	jb    down_flag, state_disp_soak
+	lcall ?back_pressed
+	jb    back_flag, jmp_state_main2_b
+	ljmp  state_disp_rflw
+jmp_state_mod_rflw:
+	ljmp  state_mod_rflw
+jmp_state_main2_b:
+	ljmp  state_main2
+
+state_disp_soak: ; display soak time and temperature
+	lcall clear_ui_flags
+	Set_Cursor(1, 1)
+	Send_Constant_String(#soak_time_txt)
+	lcall disp_soak_time
+	Set_Cursor(2, 1)
+	Send_Constant_String(#soak_temp_txt)
+	lcall disp_soak_temp
+	lcall loop_test
+	lcall ?enter_pressed
+	jb    enter_flag, state_mod_soak
+	lcall ?up_pressed
+	jb    up_flag, jmp_state_disp_rflw_b
+	lcall ?back_pressed
+	jb    back_flag, jmp_state_main2_c
+	ljmp  state_disp_soak
+jmp_state_disp_rflw_b:
+	ljmp  state_disp_rflw
+jmp_state_main2_c:
+	ljmp  state_main2
+
+state_mod_soak: ; modify reflow time and temperature
+	lcall clear_ui_flags
+	lcall loop_test
+	lcall ?back_pressed
+	jb    back_flag, jmp_state_disp_soak
+	lcall mod_soak_time
+	lcall mod_soak_temp
+	cpl   P3.7
+	ljmp  state_mod_soak
+jmp_state_disp_soak:
+	ljmp  state_disp_soak
+
+state_mod_rflw: ; modify soak time and temperature
+	lcall clear_ui_flags
+	lcall loop_test
+	lcall mod_rflw_time
+	lcall mod_rflw_temp
+	cpl   P3.7
+	lcall ?back_pressed
+	jb    back_flag, jmp_state_disp_rflw_c
+	ljmp  state_mod_rflw
+jmp_state_disp_rflw_c:
+	ljmp  state_disp_rflw
+
+;*************************************************************************************
+
+?start_pressed:
+	setb  START_BT
+	jb    START_BT, start_not_pressed
+	Wait_Milli_Seconds(#50)
+	jb    START_BT, start_not_pressed
+start_pressed: jnb START_BT, start_pressed
+	setb  on_flag
+	cpl   P3.7
+start_not_pressed:
+	ret
+	
+?stop_pressed:
+	setb  STOP_BT
+	jb    STOP_BT, stop_not_pressed
+	Wait_Milli_Seconds(#50)
+	jb    STOP_BT, stop_not_pressed
+stop_pressed: jnb STOP_BT, stop_pressed
+	clr   on_flag
+	cpl   P3.7
+stop_not_pressed:
+	ret
+	
+; check if the up button has been pressed
+?up_pressed:
+	setb  UP_BT
+	jb    UP_BT, up_not_pressed
+	Wait_Milli_Seconds(#50)
+	jb    UP_BT, up_not_pressed
+up_pressed: jnb UP_BT, up_pressed
+	setb  up_flag
+	cpl   P3.7
+	ret
+up_not_pressed:
+	clr   up_flag
+	ret
+	
+; check is the down button has been pressed
+?down_pressed:
+	setb  DOWN_BT
+	jb    DOWN_BT, down_not_pressed
+	Wait_Milli_Seconds(#50)
+	jb    DOWN_BT, down_not_pressed
+down_pressed: jnb DOWN_BT, down_pressed
+	setb  down_flag
+	cpl   P3.7
+	ret
+down_not_pressed:
+	clr   down_flag
+	ret
+
+; check if the enter button has been pressed 
+?enter_pressed:
+	setb  ENTER_BT
+	jb    ENTER_BT, enter_not_pressed
+	Wait_Milli_Seconds(#50)
+	jb    ENTER_BT, enter_not_pressed
+enter_pressed: jnb ENTER_BT, enter_pressed
+	setb  enter_flag
+	cpl   P3.7
+	ret
+enter_not_pressed:
+	clr   enter_flag
+	ret
+
+; check if the back button has been pressed
+?back_pressed:
+	setb  BACK_BT
+	jb    BACK_BT, back_not_pressed
+	Wait_Milli_Seconds(#50)
+	jb    BACK_BT, back_not_pressed
+back_pressed: jnb BACK_BT, back_pressed
+	setb  back_flag
+	cpl   P3.7
+	ret
+back_not_pressed:
+	clr   back_flag
+	ret
+
+; checks if user decided to change reflow time
+mod_rflw_time:
+	lcall ?up_pressed
+	jb    up_flag, inc_rflw_time
+	ret
+inc_rflw_time:
+	mov   a, rflw_time
+	cjne  a, #0x60, cont_inc_rflw_time
+	mov   rflw_time, #0x30
+	Set_Cursor(1, 11)
+	Send_Constant_String(#space)
+	Set_Cursor(1, 12)
+	Display_BCD(rflw_time)
+	ret
+cont_inc_rflw_time:
+	add   a, #0x0A
+	da    a
+	mov   rflw_time, a
+	Set_Cursor(1, 11)
+	Send_Constant_String(#space)
+	Set_Cursor(1, 12)
+	Display_BCD(rflw_time)
+	ret
+	
+; checks if user decided to change reflow temperature
+mod_rflw_temp:
+	lcall ?down_pressed
+	jb    down_flag, inc_rflw_temp
+	ret
+inc_rflw_temp:
+	mov   a, rflw_temp+0 
+	cjne  a, #0x40, cont_inc_rflw_temp
+	mov   a, #0x20
+	da    a
+	mov   rflw_temp+0, a
+	lcall disp_rflw_temp	
+	ret
+cont_inc_rflw_temp:
+	mov   a, rflw_temp+0
+	add   a, #0x10
+	da    a
+	mov   rflw_temp+0, a
+	lcall disp_rflw_temp
+	ret
+disp_rflw_temp:
+	Set_Cursor(2, 11)
+	Display_BCD(rflw_temp+1)
+	Set_Cursor(2, 11)
+	Send_Constant_String(#space)
+	Set_Cursor(2, 13)
+	Display_BCD(rflw_temp+0)
+	Set_Cursor(2, 15)
+	Send_Constant_String(#space)
+	ret
+disp_rflw_time: 
+	Set_Cursor(1, 11)
+	Send_Constant_String(#space)
+	Set_Cursor(1, 12)
+	Display_BCD(rflw_time)
+	set_Cursor(1, 14)
+	Send_Constant_String(#space)
+	ret
+	
+; checks if user decided to change soak time
+mod_soak_time:
+	lcall ?up_pressed
+	jb    up_flag, inc_soak_time
+	ret
+inc_soak_time:
+	mov   a, soak_time
+	cjne  a, #0x90, cont_inc_soak_time
+	mov   soak_time, #0x60
+	Set_Cursor(1, 12)
+	Display_BCD(soak_time)
+	ret
+cont_inc_soak_time:
+	add   a, #0x0A
+	da    a
+	mov   soak_time, a
+	Set_Cursor(1, 12)
+	Display_BCD(soak_time)
+	ret
+
+; checks if user decided to change soak temperature
+mod_soak_temp:
+	lcall ?down_pressed
+	jb    down_flag, inc_soak_temp
+	ret
+inc_soak_temp:
+	mov   a, soak_temp+0 
+	cjne  a, #0x80, cont_inc_soak_temp
+	sjmp  inc_soak_temp_hundreds	
+	ret
+cont_inc_soak_temp:
+	mov   a, soak_temp+0
+	cjne  a, #0x00, cont_inc_soak_temp_b
+	mov   a, #0x01
+	da    a
+	mov   soak_temp+1, a
+	mov   a, #0x40
+	da    a
+	mov   soak_temp+0, a
+	lcall disp_soak_temp
+	ret
+cont_inc_soak_temp_b:
+	mov   a, soak_temp+0
+	add   a, #0x20
+	da    a
+	mov   soak_temp+0, a
+	lcall disp_soak_temp
+	ret
+inc_soak_temp_hundreds:
+	mov   a, #0x02
+	da    a
+	mov   soak_temp+1, a
+	lcall disp_soak_temp
+	sjmp  cont_inc_soak_temp
+disp_soak_temp:
+	Set_Cursor(2, 11)
+	Display_BCD(soak_temp+1)
+	Set_Cursor(2, 11)
+	Send_Constant_String(#space)
+	Set_Cursor(2, 13)
+	Display_BCD(soak_temp+0)
+	Set_Cursor(2, 15)
+	Send_Constant_String(#space)
+	ret
+disp_soak_time:
+	Set_Cursor(1, 11)
+	Send_Constant_String(#space)
+	Set_Cursor(1, 12)
+	Display_BCD(soak_time)
+	set_Cursor(1, 14)
+	Send_Constant_String(#space)
+	ret
+	
+; navigates cursor in the settings page
+settings_cursor:
+	lcall ?up_pressed
+	jb    up_flag, settings_cursor_top
+	lcall ?down_pressed
+	jb    down_flag, settings_cursor_bot
+	ret 
+settings_cursor_top:
+	Set_Cursor(1, 1)
+	Send_Constant_String(#cursor)
+	Set_Cursor(2, 1)
+	Send_Constant_String(#space)
+	ret	
+settings_cursor_bot:
+	Set_Cursor(1, 1)
+	Send_Constant_String(#space)
+	Set_Cursor(2, 1)
+	Send_Constant_String(#cursor)
+	ret
+	
+; clear flags
+clear_ui_flags:
+	clr   up_flag
+	clr   down_flag
+	clr   enter_flag
+	clr   disp_temp_flag
+	ret	
+	
+;displays loading screen	
+loading_screen:
+	Set_Cursor(1, 5)
+   Send_Constant_String(#welcome_message) ; show the welcome message
+   Set_Cursor(2, 2)
+   Send_Constant_String(#loading)
+   Wait_Milli_Seconds(#250)
+   Wait_Milli_Seconds(#150)
+   Set_Cursor(2, 9) 
+   Send_Constant_String(#dot)
+   Wait_Milli_Seconds(#250)
+   Wait_Milli_Seconds(#150)
+   Set_Cursor(2, 10)
+   Send_Constant_String(#dot)
+   Wait_Milli_Seconds(#250)
+   Wait_Milli_Seconds(#150)
+   Set_Cursor(2, 11)
+   Send_Constant_String(#dot)
+   Set_Cursor(1, 2)
+   Wait_Milli_Seconds(#250)
+   Wait_Milli_Seconds(#150)
+	ret
+	
+; --- DELAY (1s) --- ;
+delay_1s:
+	Wait_Milli_Seconds(#250)
+	Wait_Milli_Seconds(#250)
+	Wait_Milli_Seconds(#250)
+	Wait_Milli_Seconds(#250)
+	ret	
+
+delay_half_sec:
+	Wait_Milli_Seconds(#250)
+	Wait_Milli_Seconds(#250)
+	ret
+
+; (half second long)
+; Indicates transition from one state to other
+short_buzz:
+   mov   R2, #89
+Lb3: 
+	mov   R4, #250
+Lb2: 
+	mov   R0, #166
+	cpl   SOUND_OUT
+Lb1: 
+	djnz  R0, Lb1 ; 3 cycles->3*45.21123ns*166=22.51519us
+ 	cpl   SOUND_OUT
+   djnz  R4, Lb2 ; 22.51519us*250=5.629ms
+   cpl   SOUND_OUT
+   djnz  R2, Lb3 ; 5.629ms*89=0.5s (approximately)
+   cpl   SOUND_OUT
+   ret
+	    
+long_buzz:
+   mov   R2, #255
+Lb3_a: 
+	mov   R4, #250
+Lb2_a: 
+	mov   R0, #250
+	cpl   SOUND_OUT
+Lb1_a: 
+	djnz  R0, Lb1_a ; 3 cycles->3*45.21123ns*166=22.51519us
+ 	cpl   SOUND_OUT
+   djnz  R4, Lb2_a ; 22.51519us*250=5.629ms
+   cpl   SOUND_OUT
+   djnz  R2, Lb3_a ; 5.629ms*89=0.5s (approximately)
+   cpl   SOUND_OUT
+   ret
+	
+; 6 long buzzes - indicates PCB is cool enough to handle        
+buzz_six:
+	lcall long_buzz
+	lcall delay_1s
+	lcall long_buzz
+	lcall delay_1s
+	lcall long_buzz
+	lcall delay_1s
+	lcall long_buzz
+	lcall delay_1s
+	lcall long_buzz
+	lcall delay_1s
+	lcall long_buzz
+	ret
+	
+; ******************* REFLOW FSM ************************************************
+; PURPOSE: controls the current state of the oven, and performs state transitions
+; *******************************************************************************
+init_FSM:
+	mov state, #0x00
+   clr state2_seconds_flag
+   clr state4_seconds_flag
+   mov state2_seconds, #0x00
+   mov state4_seconds, #0x00
+   ret
+forever_FSM_START:
+	mov a, state
+; --------- STATE 0 TRANSITION ---------------
+state0:
+	cjne a, #0x00, state1
+	jb  on_flag, move_to_state1
+	sjmp state0_done
+move_to_state1:
+	lcall short_buzz
+	mov state, #1
+state0_done:
+	ret
+; --------- STATE 1 TRANSITION ---------------
+state1:
+	cjne a, #1, state2
+	jnb   on_flag, move_to_state0
+	;cjne  a, #1, state2
+	clr   state2_seconds_flag
+	clr   state4_seconds_flag
+	lcall SET_DUTY_CYCLE
+	
+cont_state1:	
+	;check if we reached the soak temperature
+	clr   c
+	mov   a, soak_temp+1
+	cjne  a, oven_temp+1, state1_done
+	
+	mov   a, oven_temp+0
+	add   a, #10
+	mov   curr_temp, a
+
+	mov   a, soak_temp+0	
+	subb  a, curr_temp
+
+	jnc   state1_done
+	mov   state, #2
+	lcall short_buzz 	
+state1_done:
+	ret
+
+; -------- STATE 2 TRANSITION ----------------
+state2:
+	cjne  a, #2, state3
+	jnb   on_flag, move_to_state0
+	cjne  a, #2, state3
+	setb  state2_seconds_flag
+	clr   state4_seconds_flag
+	lcall SET_DUTY_CYCLE
+	clr   c
+	mov   a, soak_time
+	subb  a, state2_seconds
+	jnc   state2_done
+	lcall short_buzz
+	mov   state, #3
+state2_done:
+	ret
+move_to_state0:
+	mov   state, #0
+	ret
+
+; ------- STATE 3 TRANSITION ------------------
+state3:
+	cjne  a, #3, state4
+	jnb  on_flag, move_to_state0
+	;cjne  a, #3, state4
+	clr   state2_seconds_flag
+	clr   state4_seconds_flag
+	lcall SET_DUTY_CYCLE
+	
+	;check if we reached reflow temperature 
+	clr   c
+	mov   a, rflw_temp+1
+	cjne  a, oven_temp+1, state3_done
+	
+	mov   a, oven_temp+0
+	add   a, #0
+	mov   curr_temp, a
+
+	mov   a, rflw_temp+0	
+	subb  a, curr_temp
+	jnc   state3_done
+	lcall short_buzz
+	mov   state, #4
+state3_done:
+	ret
+
+; ------ STATE 4 TRANSITION -------------------
+state4:
+	cjne  a, #4, state5
+	jnb   on_flag, move_to_state0
+	setb  state4_seconds_flag
+	lcall SET_DUTY_CYCLE
+	clr   c
+	mov   a, rflw_time
+	subb  a, state4_seconds
+	jnc   state4_done
+	lcall long_buzz ; indicates to open oven door
+	mov   state, #5
+state4_done:
+	ret
+
+; ------ STATE 5 TRANSITION --------------------
+state5:
+	cjne  a, #5, jmp_state0
+	clr   on_flag
+	lcall ?back_pressed
+	jb    back_flag, jmp_state0
+	lcall ClearAllFlags
+	clr   OVEN_PIN
+	
+	mov   a, oven_temp+1
+	cjne  a, #0x00, state5_done
+	clr   c
+	mov   a, oven_temp+0
+	subb  a, #0x60
+	
+	jnc   state5_done
+	lcall buzz_six ; indicates reflow process is over
+	clr   on_flag
+	mov   state, #0
+state5_done:
+	ret
+jmp_state0:
+   clr   on_flag
+	mov   state, #0
+	ret
+
+?thermo_in:
+	mov a, state
+	cjne a, #0x01, thermo_in
+	mov a, oven_temp
+	subb a, #0x50
+	jnc thermo_in
+	clr on_flag
+	lcall short_buzz
+	clr a
+	da  a
+	mov bcd_counter, a
+	mov minutes, a
+	mov hours, a
+	
+	mov state, #0x00
+thermo_in:
+	ret
+	
+; ----------- THERMOCOUPLE + LM355 display -----------
+; displays the temperature read from LM355
+variable_display:
+	mov   x+0, variable+0
+	mov   x+1, variable+1
+	mov   x+2, #0
+	mov   x+3, #0
+
+	Load_y(500)
+	lcall mul32
+	Load_y(1023)
+	lcall div32
+	Load_y(273)
+	lcall sub32
+
+	mov   a, x
+	mov   z, a
+	lcall hex2bcd
+	
+	mov   ambient_temp+0, bcd+0
+	mov   ambient_temp+1, bcd+1
+	ret
+display_ambient_temp:
+	jb    delay_temp_disp_flag, cont_disp_temp1
+	ret
+	
+cont_disp_temp1:
+	Set_Cursor(1, 1)
+	Send_Constant_String(#ambient_temp_txt)
+	Set_Cursor(1, 6)
+	Display_BCD(bcd+1)
+	Set_Cursor(1, 8)
+	Display_BCD(bcd+0)	
+	ret
+	
+; displays temperature read from thermocouple	
+voltage_display: 
+	mov	  x+0, voltage+0
+	mov   x+1, voltage+1
+	mov   x+2, #0
+	mov   x+3, #0
+
+	Load_y(5000)
+	lcall mul32
+	Load_y(1023)
+	lcall div32
+	load_y(100)
+	lcall mul32
+	load_y(1353)
+	lcall div32
+	
+	mov   a, z
+	add   a, x
+	mov   x, a
+	lcall hex2bcd
+	
+	Wait_Milli_Seconds(#4)
+	putty(bcd+1)
+	putty(bcd+0)
+	
+	mov   a, #'\n'
+	lcall putchar
+	mov   a, #'\r' 
+	lcall putchar
+	
+	mov   oven_temp+0, bcd+0
+	mov   oven_temp+1, bcd+1
+	ret
+	
+display_oven_temp:
+	
+	jb    delay_temp_disp_flag, cont_disp_temp2
+	ret
+	
+cont_disp_temp2:
+	Set_Cursor(2, 1)
+	Send_Constant_String(#oven_temp_txt)
+	Set_Cursor(2, 6)
+	Display_BCD(bcd+1)
+	Set_Cursor(2, 8)
+	Display_BCD(bcd+0)
+	ret
+
+; ------------------------ DUTY CYCLE DECODER --------------------
+; PURPOSE: Controls how and when the oven turns on
+; ----------------------------------------------------------------
+SET_DUTY_CYCLE:
+	mov   a, state
+
+; ------ STATE 0 -----------
+State0Duty:
+	cjne  a, #0x00, State1Duty
+	ljmp  ClearAllFlags
+	ret
+
+; ------ STATE 1 -----------
+; rising temp
+State1Duty:
+	mov   a, state
+	cjne  a, #0x01, State2Duty
+	
+	; --- set flags ---
+	setb  s8
+	
+	clr   s9
+	;clr   s8
+	clr   s7
+	clr   s6
+	clr   s5
+	clr   s4
+	clr   s3
+	clr   s2
+	clr   s1
+	clr   s0				
+	ret
+
+; ----- STATE 2 -----------
+; flatline temp	
+State2Duty:
+	cjne  a, #2, State3Duty
+	mov   a, soak_temp+0
+	cjne  a, #0x40, Soak_Temp2_160		   		  
+	; hold 140 degrees
+	setb  s1
+
+	clr   s8
+	clr   s7
+	clr   s6
+	clr   s5
+	clr   s4
+	clr   s3
+	clr   s2
+	;clr   s1
+	clr  s0	
+	ret
+	
+Soak_Temp2_160:  
+	cjne  a, #160, Soak_Temp2_180    
+	;SET FLAGS
+	;IN HERE
+	ret
+	
+Soak_Temp2_180:  
+	cjne  a, #180, Soak_Temp2_200
+	;SET FLAGS
+	;IN HERE
+	ret
+	
+Soak_Temp2_200:
+	;SET FLAGS
+	;IN HERE
+	ret
+	
+; ------- STATE 3 -----------
+; PURPOSE: ramp to peak 
+State3Duty:
+	cjne  a, #3, State4Duty
+	;SET FLAGS
+	;IN HERE
+	setb  s7
+	
+	clr   s8
+	;clr  s7
+	clr   s6
+	clr   s5
+	clr   s4
+	clr   s3
+	clr   s2
+	clr   s1
+	clr   s0	
+	ret
+
+; ------ STATE 4 -----------
+; PURPOSE: ramp down. Hold soak value for duration of time 	
+State4Duty:
+	cjne  a, #4, State5Duty
+	;SET FLAGS
+	;IN HERE
+	setb  s2
+	
+	clr   s8
+	clr   s7
+	clr   s6
+	clr   s5
+	clr   s4
+	clr   s3
+	;clr   s2
+	clr   s1
+	clr  s0	
+	ret
+	
+; ------- STATE 5 ----------
+State5Duty:
+	lcall ClearAllFlags
+	ret   
+
+ClearAllFlags:
+	clr   s0
+	clr   s1
+	clr   s2
+	clr   s3
+	clr   s4
+	clr   s5
+	clr   s6
+	clr   s7
+	clr   s8
+	clr   s9
+	ret
+
+END
